@@ -173,7 +173,7 @@ const formatTimestamp = (iso: string): string => {
 const buildTweetHtml = (tweet: ExtractedTweet): string => {
   const parts: string[] = [];
 
-  // Author header
+  // Author header with link to tweet (timestamp links to the tweet URL, matching Twitter's pattern)
   const authorParts: string[] = [];
   if (tweet.authorName) {
     authorParts.push(`<strong>${tweet.authorName}</strong>`);
@@ -182,7 +182,12 @@ const buildTweetHtml = (tweet: ExtractedTweet): string => {
     authorParts.push(tweet.authorHandle);
   }
   if (tweet.timestamp) {
-    authorParts.push(formatTimestamp(tweet.timestamp));
+    const formatted = formatTimestamp(tweet.timestamp);
+    if (tweet.tweetUrl) {
+      authorParts.push(`<a href="${tweet.tweetUrl}">${formatted}</a>`);
+    } else {
+      authorParts.push(formatted);
+    }
   }
   if (authorParts.length > 0) {
     parts.push(`<p>${authorParts.join(" · ")}</p>`);

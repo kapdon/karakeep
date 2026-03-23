@@ -1,19 +1,6 @@
 import { useMemo } from "react";
 import { MessageSquare } from "lucide-react";
-import {
-  enrichTweet,
-  QuotedTweet,
-  TweetActions,
-  TweetBody,
-  TweetContainer,
-  TweetHeader,
-  TweetInReplyTo,
-  TweetInfo,
-  TweetMedia,
-  TweetNotFound,
-  TweetSkeleton,
-  useTweet,
-} from "react-tweet";
+import { Tweet } from "react-tweet";
 import { useQuery } from "@tanstack/react-query";
 
 import { useTRPC } from "@karakeep/shared-react/trpc";
@@ -37,15 +24,27 @@ function extractTweetId(url: string): string | null {
 }
 
 /**
- * Extract the replies section from the cached HTML content.
- * Our Twitter plugin generates HTML with <h3>Replies</h3> followed by <blockquote> elements.
+ * Extract reply tweet IDs from the cached HTML content.
+ * Our Twitter plugin embeds timestamp links to each reply's tweet URL
+ * (e.g. https://x.com/user/status/12345) inside blockquotes after <h3>Replies</h3>.
+ * We parse those to get the reply tweet IDs.
  */
-function extractRepliesHtml(html: string): string | null {
+function extractReplyTweetIds(html: string): string[] {
   const repliesIdx = html.indexOf("<h3>Replies</h3>");
   if (repliesIdx === -1) {
-    return null;
+    return [];
   }
-  return html.slice(repliesIdx);
+  const repliesSection = html.slice(repliesIdx);
+  const ids: string[] = [];
+  const linkPattern =
+    /href="https?:\/\/(?:twitter\.com|x\.com)\/\w+\/status\/(\d+)"/g;
+  let match;
+  while ((match = linkPattern.exec(repliesSection)) !== null) {
+    if (!ids.includes(match[1])) {
+      ids.push(match[1]);
+    }
+  }
+  return ids;
 }
 
 function canRenderX(bookmark: ZBookmark): boolean {
@@ -55,43 +54,6 @@ function canRenderX(bookmark: ZBookmark): boolean {
 
   const url = bookmark.content.url;
   return extractTweetId(url) !== null;
-}
-
-/**
- * Custom embedded tweet that replaces TweetReplies ("Read N replies" link)
- * with actual reply content extracted by our crawler plugin.
- */
-function CustomEmbeddedTweet({
-  tweetId,
-  repliesHtml,
-}: {
-  tweetId: string;
-  repliesHtml: string | null;
-}) {
-  const { data, error, isLoading } = useTweet(tweetId);
-
-  if (isLoading) return <TweetSkeleton />;
-  if (error || !data) return <TweetNotFound error={error} />;
-
-  const tweet = enrichTweet(data);
-
-  return (
-    <TweetContainer>
-      <TweetHeader tweet={tweet} />
-      {tweet.in_reply_to_status_id_str && <TweetInReplyTo tweet={tweet} />}
-      <TweetBody tweet={tweet} />
-      {tweet.mediaDetails?.length ? <TweetMedia tweet={tweet} /> : null}
-      {tweet.quoted_tweet && <QuotedTweet tweet={tweet.quoted_tweet} />}
-      <TweetInfo tweet={tweet} />
-      <TweetActions tweet={tweet} />
-      {repliesHtml && (
-        <div
-          className="prose max-w-none px-4 pb-3 pt-1 dark:prose-invert prose-p:my-1 prose-blockquote:border-l-muted-foreground/30 prose-blockquote:pl-4 prose-blockquote:not-italic prose-img:my-2 prose-hr:my-4"
-          dangerouslySetInnerHTML={{ __html: repliesHtml }}
-        />
-      )}
-    </TweetContainer>
-  );
 }
 
 function XRendererComponent({ bookmark }: { bookmark: ZBookmark }) {
@@ -112,9 +74,9 @@ function XRendererComponent({ bookmark }: { bookmark: ZBookmark }) {
     ),
   );
 
-  const repliesHtml = useMemo(() => {
-    if (!htmlContent) return null;
-    return extractRepliesHtml(htmlContent);
+  const replyTweetIds = useMemo(() => {
+    if (!htmlContent) return [];
+    return extractReplyTweetIds(htmlContent);
   }, [htmlContent]);
 
   if (bookmark.content.type !== BookmarkTypes.LINK) {
@@ -129,8 +91,15 @@ function XRendererComponent({ bookmark }: { bookmark: ZBookmark }) {
   return (
     <div className="relative h-full w-full overflow-auto">
       <div className="flex justify-center p-4">
-        <CustomEmbeddedTweet tweetId={tweetId} repliesHtml={repliesHtml} />
+        <Tweet id={tweetId} />
       </div>
+      {replyTweetIds.length > 0 && (
+        <div className="flex flex-col items-center gap-4 px-4 pb-8">
+          {replyTweetIds.map((id) => (
+            <Tweet key={id} id={id} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
