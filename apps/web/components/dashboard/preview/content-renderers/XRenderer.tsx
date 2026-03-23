@@ -16,7 +16,13 @@ import { useQuery } from "@tanstack/react-query";
 import { useTRPC } from "@karakeep/shared-react/trpc";
 import { BookmarkTypes, ZBookmark } from "@karakeep/shared/types/bookmarks";
 
+import type { ArticleSegment } from "./xArticleSegments";
 import { ContentRenderer } from "./types";
+import {
+  extractReplyTweetIds,
+  isArticleContent,
+  parseArticleSegments,
+} from "./xArticleSegments";
 
 function extractTweetId(url: string): string | null {
   const patterns = [
@@ -31,96 +37,6 @@ function extractTweetId(url: string): string | null {
     }
   }
   return null;
-}
-
-/**
- * Extract reply tweet IDs from the cached HTML content.
- */
-function extractReplyTweetIds(html: string): string[] {
-  const repliesIdx = html.indexOf("<h3>Replies</h3>");
-  if (repliesIdx === -1) {
-    return [];
-  }
-  const repliesSection = html.slice(repliesIdx);
-  const ids: string[] = [];
-  const linkPattern =
-    /href="https?:\/\/(?:twitter\.com|x\.com)\/\w+\/status\/(\d+)"/g;
-  let match;
-  while ((match = linkPattern.exec(repliesSection)) !== null) {
-    if (!ids.includes(match[1])) {
-      ids.push(match[1]);
-    }
-  }
-  return ids;
-}
-
-/** Check if the extracted HTML is an article (has <h1> title). */
-function isArticleContent(html: string): boolean {
-  return html.includes("<h1>");
-}
-
-/**
- * Parse article HTML into an ordered list of content segments.
- * Each segment is either a raw HTML block or an embedded tweet ID.
- */
-interface HtmlSegment {
-  type: "html";
-  content: string;
-}
-interface TweetSegment {
-  type: "tweet";
-  id: string;
-}
-type ArticleSegment = HtmlSegment | TweetSegment;
-
-function parseArticleSegments(html: string): ArticleSegment[] {
-  // Only parse up to the Replies section — replies are handled separately
-  // by extractReplyTweetIds and rendered as individual <Tweet> cards.
-  const repliesIdx = html.indexOf("<h3>Replies</h3>");
-  const articleHtml = repliesIdx !== -1 ? html.slice(0, repliesIdx) : html;
-
-  const segments: ArticleSegment[] = [];
-  // Split on blockquotes that contain tweet status links
-  // Pattern: <blockquote>...<a href="https://x.com/.../status/ID">...</a>...</blockquote>
-  const blockquotePattern = /<blockquote>([\s\S]*?)<\/blockquote>/g;
-  let lastIndex = 0;
-  let match;
-
-  while ((match = blockquotePattern.exec(articleHtml)) !== null) {
-    // Add HTML before this blockquote
-    if (match.index > lastIndex) {
-      const before = articleHtml.slice(lastIndex, match.index).trim();
-      if (before) {
-        segments.push({ type: "html", content: before });
-      }
-    }
-
-    // Check if this blockquote contains a tweet status link
-    const blockContent = match[1];
-    const tweetIdMatch = blockContent.match(
-      /href="https?:\/\/(?:twitter\.com|x\.com)\/\w+\/status\/(\d+)"/,
-    );
-
-    if (tweetIdMatch) {
-      // This is an embedded tweet — render natively
-      segments.push({ type: "tweet", id: tweetIdMatch[1] });
-    } else {
-      // Regular blockquote — keep as HTML
-      segments.push({ type: "html", content: match[0] });
-    }
-
-    lastIndex = match.index + match[0].length;
-  }
-
-  // Add remaining HTML after last blockquote
-  if (lastIndex < articleHtml.length) {
-    const remaining = articleHtml.slice(lastIndex).trim();
-    if (remaining) {
-      segments.push({ type: "html", content: remaining });
-    }
-  }
-
-  return segments;
 }
 
 /**

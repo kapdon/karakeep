@@ -89,6 +89,11 @@ import {
   parseSubprocessErrorSchema,
   parseSubprocessOutputSchema,
 } from "./utils/parseHtmlSubprocessIpc";
+import type { XArticleReply } from "./utils/xStatusPage";
+import {
+  extractXArticleRepliesFromStatusHtml,
+  extractXArticleUrlFromStatusHtml,
+} from "./utils/xStatusPage";
 
 const tracer = getTracer("@karakeep/workers");
 
@@ -786,7 +791,7 @@ async function crawlPage(
         // Detect X/Twitter article links and navigate to the article page.
         // Articles (x.com/i/article/*) require authentication and are only
         // accessible when cookies are loaded in the browser context.
-        await withSpan(
+        const articleReplyData = await withSpan<XArticleReply[] | null>(
           tracer,
           "crawlerWorker.crawlPage.detectXArticle",
           {
@@ -801,27 +806,15 @@ async function crawlPage(
                 /^https?:\/\/(twitter\.com|x\.com)\/\w+\/status\//.test(
                   currentUrl,
                 );
-              if (!isXPage) return;
+              if (!isXPage) return null;
 
-              const articleUrl = await activePage.evaluate(() => {
-                const links = document.querySelectorAll("a[href]");
-                for (const link of links) {
-                  const href = link.getAttribute("href") ?? "";
-                  // Article links can be:
-                  //   /username/article/12345 (relative)
-                  //   https://x.com/username/article/12345 (absolute)
-                  //   /i/article/12345 (alternative format)
-                  const relMatch = href.match(/^\/[\w]+\/article\/(\d+)$/);
-                  if (relMatch) return `https://x.com${href}`;
-                  const absMatch = href.match(
-                    /https?:\/\/(?:twitter\.com|x\.com)\/[\w]+\/article\/\d+/,
-                  );
-                  if (absMatch) return absMatch[0];
-                }
-                return null;
-              });
+              const initialStatusHtml = await activePage.content();
+              const articleUrl = extractXArticleUrlFromStatusHtml(
+                initialStatusHtml,
+                currentUrl,
+              );
 
-              if (!articleUrl) return;
+              if (!articleUrl) return null;
 
               // Before navigating away, extract reply tweets from the current
               // tweet page so we can append them to the article content.
@@ -832,76 +825,12 @@ async function crawlPage(
               );
               await new Promise((resolve) => setTimeout(resolve, 2000));
 
-              const replyData = await activePage.evaluate(() => {
-                const tweets = document.querySelectorAll(
-                  '[data-testid="tweet"]',
-                );
-                if (tweets.length <= 1) return null;
-                // First tweet is the main tweet; rest are replies.
-                // Skip tweets nested inside the main tweet (embedded tweets
-                // in article cards are NOT replies).
-                const mainTweet = tweets[0];
-                const replies: {
-                  author: string;
-                  handle: string;
-                  text: string;
-                  statusUrl: string;
-                }[] = [];
-                for (let i = 1; i < tweets.length && i <= 20; i++) {
-                  const tweet = tweets[i];
-                  if (mainTweet.contains(tweet)) continue;
-                  const textEl = tweet.querySelector(
-                    '[data-testid="tweetText"]',
-                  );
-                  const text = textEl?.textContent?.trim() ?? "";
-                  // Find author handle
-                  let handle = "";
-                  let author = "";
-                  const links = tweet.querySelectorAll('a[role="link"]');
-                  for (const link of links) {
-                    const href = link.getAttribute("href") ?? "";
-                    const linkText = link.textContent?.trim() ?? "";
-                    if (
-                      !handle &&
-                      linkText.startsWith("@") &&
-                      /^\/\w+$/.test(href)
-                    ) {
-                      handle = linkText;
-                    }
-                    if (
-                      !author &&
-                      !linkText.startsWith("@") &&
-                      /^\/\w+$/.test(href) &&
-                      linkText
-                    ) {
-                      author = linkText;
-                    }
-                  }
-                  // Find status URL
-                  let statusUrl = "";
-                  const statusLinks = tweet.querySelectorAll(
-                    'a[href*="/status/"]',
-                  );
-                  for (const sl of statusLinks) {
-                    const href = sl.getAttribute("href") ?? "";
-                    if (/^\/\w+\/status\/\d+$/.test(href)) {
-                      statusUrl = `https://x.com${href}`;
-                      break;
-                    }
-                  }
-                  if (text || statusUrl) {
-                    replies.push({ author, handle, text, statusUrl });
-                  }
-                }
-                return replies.length > 0 ? replies : null;
-              });
+              const replyData = extractXArticleRepliesFromStatusHtml(
+                await activePage.content(),
+                currentUrl,
+              );
 
               if (replyData) {
-                // Store reply data on the page context — we'll inject it into
-                // the captured HTML after navigating to the article.
-                (
-                  activePage as unknown as Record<string, unknown>
-                ).__xArticleReplies = replyData;
                 logger.info(
                   `[Crawler][${jobId}] Captured ${replyData.length} reply tweets before navigating to article.`,
                 );
@@ -927,10 +856,12 @@ async function crawlPage(
               logger.info(
                 `[Crawler][${jobId}] Successfully navigated to X article page.`,
               );
+              return replyData;
             } catch (e) {
               logger.warn(
                 `[Crawler][${jobId}] Failed to navigate to X article page, continuing with original content: ${e}`,
               );
+              return null;
             }
           },
         );
@@ -1077,17 +1008,8 @@ async function crawlPage(
         // original tweet page, inject it into the HTML as a hidden section
         // that the metascraper plugin can parse.
         let finalHtmlContent = htmlContent;
-        const replyData = (activePage as unknown as Record<string, unknown>)
-          .__xArticleReplies as
-          | {
-              author: string;
-              handle: string;
-              text: string;
-              statusUrl: string;
-            }[]
-          | undefined;
-        if (replyData && replyData.length > 0) {
-          const replyHtml = replyData
+        if (articleReplyData && articleReplyData.length > 0) {
+          const replyHtml = articleReplyData
             .map((r) => {
               const header = [r.author, r.handle].filter(Boolean).join(" · ");
               const link = r.statusUrl

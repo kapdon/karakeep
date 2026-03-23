@@ -5,6 +5,17 @@ import logger from "@karakeep/shared/logger";
 
 const MAX_REPLIES = 20;
 
+/**
+ * Escape HTML special characters to prevent XSS when inserting
+ * user-controlled text into HTML strings.
+ */
+const escapeHtml = (text: string): string =>
+  text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
 interface ExtractedTweet {
   authorName: string;
   authorHandle: string;
@@ -176,10 +187,10 @@ const buildTweetHtml = (tweet: ExtractedTweet): string => {
   // Author header with link to tweet (timestamp links to the tweet URL, matching Twitter's pattern)
   const authorParts: string[] = [];
   if (tweet.authorName) {
-    authorParts.push(`<strong>${tweet.authorName}</strong>`);
+    authorParts.push(`<strong>${escapeHtml(tweet.authorName)}</strong>`);
   }
   if (tweet.authorHandle) {
-    authorParts.push(tweet.authorHandle);
+    authorParts.push(escapeHtml(tweet.authorHandle));
   }
   if (tweet.timestamp) {
     const formatted = formatTimestamp(tweet.timestamp);
@@ -236,10 +247,7 @@ const isArticleUrl = (url: string): boolean => {
  * Content elements are interleaved in the DOM — we walk them in order
  * to preserve the article's reading flow.
  */
-const extractArticleFromDom = (
-  $: CheerioAPI,
-  _url: string,
-): string | undefined => {
+const extractArticleFromDom = ($: CheerioAPI): string | undefined => {
   const parts: string[] = [];
 
   // Extract title
@@ -481,17 +489,17 @@ const extractFromMetaTags = (
       try {
         const username = new URL(url).pathname.split("/")[1];
         parts.push(
-          `<p><strong>${authorMatch[1]}</strong>${username ? ` @${username}` : ""}</p>`,
+          `<p><strong>${escapeHtml(authorMatch[1])}</strong>${username ? ` @${escapeHtml(username)}` : ""}</p>`,
         );
       } catch {
-        parts.push(`<p><strong>${authorMatch[1]}</strong></p>`);
+        parts.push(`<p><strong>${escapeHtml(authorMatch[1])}</strong></p>`);
       }
     }
   }
 
   // Tweet text from description
   if (ogDescription) {
-    parts.push(`<p>${ogDescription}</p>`);
+    parts.push(`<p>${escapeHtml(ogDescription)}</p>`);
   }
 
   // Image (skip the default X/Twitter OG image)
@@ -544,7 +552,7 @@ const metascraperTwitter = () => {
     }) => {
       // Handle X article pages (x.com/i/article/*)
       if (isArticleUrl(url)) {
-        const articleContent = extractArticleFromDom(htmlDom, url);
+        const articleContent = extractArticleFromDom(htmlDom);
         if (articleContent) {
           return articleContent;
         }
