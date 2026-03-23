@@ -524,6 +524,16 @@ const metascraperTwitter = () => {
       const titleEl = htmlDom('[data-testid="twitter-article-title"]');
       return titleEl.text().trim() || undefined;
     }) as unknown as RulesOptions,
+    image: (({ htmlDom, url }: { htmlDom: CheerioAPI; url: string }) => {
+      if (!isArticleUrl(url)) return undefined;
+      // Extract the article banner image and normalize to name=small
+      // to avoid download failures with larger size variants (name=900x900).
+      const img = htmlDom('[data-testid="tweetPhoto"] img').first();
+      const src = img.attr("src");
+      if (!src) return undefined;
+      // Normalize the size parameter to "small" for reliable downloading
+      return src.replace(/name=\w+/, "name=small");
+    }) as unknown as RulesOptions,
     author: (({ htmlDom, url }: { htmlDom: CheerioAPI; url: string }) => {
       if (!isArticleUrl(url)) return undefined;
       // Extract author from UserAvatar-Container that's NOT inside an embedded tweet.
