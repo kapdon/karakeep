@@ -783,6 +783,160 @@ async function crawlPage(
           `[Crawler][${jobId}] Finished waiting for the page to load.`,
         );
 
+        // Detect X/Twitter article links and navigate to the article page.
+        // Articles (x.com/i/article/*) require authentication and are only
+        // accessible when cookies are loaded in the browser context.
+        await withSpan(
+          tracer,
+          "crawlerWorker.crawlPage.detectXArticle",
+          {
+            attributes: {
+              "job.id": jobId,
+            },
+          },
+          async () => {
+            try {
+              const currentUrl = activePage.url();
+              const isXPage =
+                /^https?:\/\/(twitter\.com|x\.com)\/\w+\/status\//.test(
+                  currentUrl,
+                );
+              if (!isXPage) return;
+
+              const articleUrl = await activePage.evaluate(() => {
+                const links = document.querySelectorAll("a[href]");
+                for (const link of links) {
+                  const href = link.getAttribute("href") ?? "";
+                  // Article links can be:
+                  //   /username/article/12345 (relative)
+                  //   https://x.com/username/article/12345 (absolute)
+                  //   /i/article/12345 (alternative format)
+                  const relMatch = href.match(/^\/[\w]+\/article\/(\d+)$/);
+                  if (relMatch) return `https://x.com${href}`;
+                  const absMatch = href.match(
+                    /https?:\/\/(?:twitter\.com|x\.com)\/[\w]+\/article\/\d+/,
+                  );
+                  if (absMatch) return absMatch[0];
+                }
+                return null;
+              });
+
+              if (!articleUrl) return;
+
+              // Before navigating away, extract reply tweets from the current
+              // tweet page so we can append them to the article content.
+              // Scroll to the bottom to trigger lazy-loading of replies.
+              // Twitter only loads replies when they're scrolled into view.
+              await activePage.evaluate(() =>
+                window.scrollTo(0, document.body.scrollHeight),
+              );
+              await new Promise((resolve) => setTimeout(resolve, 2000));
+
+              const replyData = await activePage.evaluate(() => {
+                const tweets = document.querySelectorAll(
+                  '[data-testid="tweet"]',
+                );
+                if (tweets.length <= 1) return null;
+                // First tweet is the main tweet; rest are replies.
+                // Skip tweets nested inside the main tweet (embedded tweets
+                // in article cards are NOT replies).
+                const mainTweet = tweets[0];
+                const replies: {
+                  author: string;
+                  handle: string;
+                  text: string;
+                  statusUrl: string;
+                }[] = [];
+                for (let i = 1; i < tweets.length && i <= 20; i++) {
+                  const tweet = tweets[i];
+                  if (mainTweet.contains(tweet)) continue;
+                  const textEl = tweet.querySelector(
+                    '[data-testid="tweetText"]',
+                  );
+                  const text = textEl?.textContent?.trim() ?? "";
+                  // Find author handle
+                  let handle = "";
+                  let author = "";
+                  const links = tweet.querySelectorAll('a[role="link"]');
+                  for (const link of links) {
+                    const href = link.getAttribute("href") ?? "";
+                    const linkText = link.textContent?.trim() ?? "";
+                    if (
+                      !handle &&
+                      linkText.startsWith("@") &&
+                      /^\/\w+$/.test(href)
+                    ) {
+                      handle = linkText;
+                    }
+                    if (
+                      !author &&
+                      !linkText.startsWith("@") &&
+                      /^\/\w+$/.test(href) &&
+                      linkText
+                    ) {
+                      author = linkText;
+                    }
+                  }
+                  // Find status URL
+                  let statusUrl = "";
+                  const statusLinks = tweet.querySelectorAll(
+                    'a[href*="/status/"]',
+                  );
+                  for (const sl of statusLinks) {
+                    const href = sl.getAttribute("href") ?? "";
+                    if (/^\/\w+\/status\/\d+$/.test(href)) {
+                      statusUrl = `https://x.com${href}`;
+                      break;
+                    }
+                  }
+                  if (text || statusUrl) {
+                    replies.push({ author, handle, text, statusUrl });
+                  }
+                }
+                return replies.length > 0 ? replies : null;
+              });
+
+              if (replyData) {
+                // Store reply data on the page context — we'll inject it into
+                // the captured HTML after navigating to the article.
+                (
+                  activePage as unknown as Record<string, unknown>
+                ).__xArticleReplies = replyData;
+                logger.info(
+                  `[Crawler][${jobId}] Captured ${replyData.length} reply tweets before navigating to article.`,
+                );
+              }
+
+              logger.info(
+                `[Crawler][${jobId}] Detected X article link: "${articleUrl}". Navigating to article page...`,
+              );
+
+              await activePage.goto(articleUrl, {
+                timeout: serverConfig.crawler.navigateTimeoutSec * 1000,
+                waitUntil: "domcontentloaded",
+              });
+
+              await Promise.race([
+                activePage
+                  .waitForLoadState("networkidle", { timeout: 5000 })
+                  .catch(() => ({})),
+                new Promise((resolve) => setTimeout(resolve, 5000)),
+                abortPromise(abortSignal),
+              ]);
+
+              logger.info(
+                `[Crawler][${jobId}] Successfully navigated to X article page.`,
+              );
+            } catch (e) {
+              logger.warn(
+                `[Crawler][${jobId}] Failed to navigate to X article page, continuing with original content: ${e}`,
+              );
+            }
+          },
+        );
+
+        abortSignal.throwIfAborted();
+
         const [htmlContent, screenshot, pdf] = await withSpan(
           tracer,
           "crawlerWorker.crawlPage.captureAssets",
@@ -919,8 +1073,34 @@ async function crawlPage(
           },
         );
 
+        // If we navigated to an X article and captured reply data from the
+        // original tweet page, inject it into the HTML as a hidden section
+        // that the metascraper plugin can parse.
+        let finalHtmlContent = htmlContent;
+        const replyData = (activePage as unknown as Record<string, unknown>)
+          .__xArticleReplies as
+          | {
+              author: string;
+              handle: string;
+              text: string;
+              statusUrl: string;
+            }[]
+          | undefined;
+        if (replyData && replyData.length > 0) {
+          const replyHtml = replyData
+            .map((r) => {
+              const header = [r.author, r.handle].filter(Boolean).join(" · ");
+              const link = r.statusUrl
+                ? `<a href="${r.statusUrl}">${r.statusUrl}</a>`
+                : "";
+              return `<blockquote><p><strong>${header}</strong></p><p>${r.text}</p>${link ? `<p>${link}</p>` : ""}</blockquote>`;
+            })
+            .join("\n");
+          finalHtmlContent += `\n<hr /><h3>Replies</h3>\n${replyHtml}`;
+        }
+
         return {
-          htmlContent,
+          htmlContent: finalHtmlContent,
           statusCode: response?.status() ?? 0,
           screenshot,
           pdf,

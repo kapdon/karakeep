@@ -213,6 +213,184 @@ const buildTweetHtml = (tweet: ExtractedTweet): string => {
 };
 
 /**
+ * Check if a URL is an X article page.
+ */
+const isArticleUrl = (url: string): boolean => {
+  try {
+    return /\/[\w]+\/article\/\d+/.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Extract content from an X article page.
+ * X articles use a Draft.js-based rich text editor with specific data-testid attributes:
+ * - [data-testid="twitter-article-title"] — article title
+ * - [data-testid="twitterArticleRichTextView"] — article container
+ * - [data-testid="longformRichTextComponent"] — rich text body
+ * - [data-block="true"] — individual text blocks within the rich text
+ * - [data-testid="tweetPhoto"] img — embedded images (interleaved with text)
+ * - [data-testid="tweet"] — embedded tweets (interleaved with text)
+ *
+ * Content elements are interleaved in the DOM — we walk them in order
+ * to preserve the article's reading flow.
+ */
+const extractArticleFromDom = (
+  $: CheerioAPI,
+  _url: string,
+): string | undefined => {
+  const parts: string[] = [];
+
+  // Extract title
+  const titleEl = $('[data-testid="twitter-article-title"]');
+  if (titleEl.length > 0) {
+    const titleText = titleEl.text().trim();
+    if (titleText) {
+      parts.push(`<h1>${titleText}</h1>`);
+    }
+  }
+
+  // Banner image — the first tweetPhoto on the page (before the rich text view)
+  const firstPhoto = $('[data-testid="tweetPhoto"] img').first();
+  if (firstPhoto.length > 0) {
+    const src = firstPhoto.attr("src");
+    if (src) {
+      parts.push(`<img src="${src}" />`);
+    }
+  }
+
+  // Walk all descendants of the rich text view in DOM order.
+  // Track seen elements to avoid duplicates from nested matches.
+  const richView = $('[data-testid="twitterArticleRichTextView"]');
+  if (richView.length === 0) {
+    return parts.length > 0 ? parts.join("\n") : undefined;
+  }
+
+  const seen = new Set<object>();
+
+  richView.find("*").each((_, el) => {
+    if (seen.has(el)) return;
+
+    const testId = $(el).attr("data-testid") ?? "";
+    const isBlock = $(el).attr("data-block") === "true";
+
+    if (isBlock) {
+      seen.add(el);
+      // Skip text blocks that are inside or contain embedded tweets —
+      // those are handled by the tweet extraction below.
+      if (
+        $(el).closest('[data-testid="tweet"]').length > 0 ||
+        $(el).closest('[data-testid="simpleTweet"]').length > 0 ||
+        $(el).find('[data-testid="tweet"]').length > 0 ||
+        $(el).find('[data-testid="simpleTweet"]').length > 0
+      ) {
+        return;
+      }
+      // Preserve links by extracting text and <a> tags from the block.
+      // Draft.js wraps content in nested spans — we walk leaf nodes only,
+      // skipping spans that are inside <a> tags (the <a> itself handles those).
+      const blockParts: string[] = [];
+      $(el)
+        .find("span, a")
+        .each((_, child) => {
+          if ($(child).is("a")) {
+            const href = $(child).attr("href") ?? "";
+            const linkText = $(child).text().trim();
+            if (href && linkText) {
+              blockParts.push(`<a href="${href}">${linkText}</a>`);
+            }
+          } else if ($(child).is("span")) {
+            // Skip spans inside <a> tags — already handled above
+            if ($(child).closest("a").length > 0) return;
+            // Only emit leaf spans (no child spans or anchors)
+            if (
+              $(child).children("a").length === 0 &&
+              $(child).children("span").length === 0
+            ) {
+              const text = $(child).text();
+              if (text) {
+                blockParts.push(text);
+              }
+            }
+          }
+        });
+      const blockHtml = blockParts.join("").trim();
+      if (blockHtml) {
+        parts.push(`<p>${blockHtml}</p>`);
+      }
+    } else if (testId === "tweetPhoto") {
+      seen.add(el);
+      // Skip photos inside embedded tweets
+      if (
+        $(el).closest('[data-testid="tweet"]').length > 0 ||
+        $(el).closest('[data-testid="simpleTweet"]').length > 0
+      ) {
+        return;
+      }
+      // Skip the banner image we already extracted
+      const img = $(el).find("img").first();
+      const src = img.attr("src") ?? "";
+      if (src && src !== firstPhoto.attr("src")) {
+        parts.push(`<img src="${src}" />`);
+      }
+    } else if (testId === "tweet" || testId === "simpleTweet") {
+      seen.add(el);
+      // Mark all descendants as seen so they don't get processed individually
+      $(el)
+        .find("*")
+        .each((_, descendant) => {
+          seen.add(descendant);
+        });
+      // Extract embedded tweet — get all tweetText elements (first is the main
+      // tweet, second is a quote tweet if present) and a link to the original.
+      const tweetTexts = $(el).find('[data-testid="tweetText"]');
+      const statusLink = $(el).find('a[href*="/status/"]').first();
+      const href = statusLink.attr("href") ?? "";
+      const tweetUrl = href ? `https://x.com${href.split("?")[0]}` : "";
+
+      const mainText = tweetTexts.eq(0).text().trim();
+      const quoteText =
+        tweetTexts.length > 1 ? tweetTexts.eq(1).text().trim() : "";
+
+      if (mainText || tweetUrl) {
+        const contentParts: string[] = [];
+        if (mainText) {
+          contentParts.push(`<p>${mainText}</p>`);
+        }
+        if (quoteText) {
+          contentParts.push(`<blockquote><p>${quoteText}</p></blockquote>`);
+        }
+        if (tweetUrl) {
+          contentParts.push(`<p><a href="${tweetUrl}">${tweetUrl}</a></p>`);
+        }
+        parts.push(`<blockquote>${contentParts.join("\n")}</blockquote>`);
+      }
+    }
+  });
+
+  // Extract replies section — injected by the crawler from the original tweet
+  // page before navigating to the article. Format: <h3>Replies</h3> followed
+  // by <blockquote> elements containing reply text and tweet status links.
+  const repliesHeader = $("h3").filter((_, el) => $(el).text() === "Replies");
+  if (repliesHeader.length > 0) {
+    parts.push("<hr />");
+    parts.push("<h3>Replies</h3>");
+    // Collect all blockquotes that follow the Replies header
+    let next = repliesHeader.first().next();
+    while (next.length > 0 && next.is("blockquote")) {
+      const html = next.html()?.trim();
+      if (html) {
+        parts.push(`<blockquote>${html}</blockquote>`);
+      }
+      next = next.next();
+    }
+  }
+
+  return parts.length > 0 ? parts.join("\n") : undefined;
+};
+
+/**
  * Full DOM-based extraction for authenticated sessions.
  * Extracts thread context, main tweet, and replies.
  */
@@ -333,6 +511,30 @@ const metascraperTwitter = () => {
   const rules: Rules = {
     pkgName: "metascraper-twitter",
     test,
+    title: (({ htmlDom, url }: { htmlDom: CheerioAPI; url: string }) => {
+      if (!isArticleUrl(url)) return undefined;
+      const titleEl = htmlDom('[data-testid="twitter-article-title"]');
+      return titleEl.text().trim() || undefined;
+    }) as unknown as RulesOptions,
+    author: (({ htmlDom, url }: { htmlDom: CheerioAPI; url: string }) => {
+      if (!isArticleUrl(url)) return undefined;
+      // Extract author from UserAvatar-Container that's NOT inside an embedded tweet.
+      // The testid format is UserAvatar-Container-{username}.
+      let authorUsername: string | undefined;
+      htmlDom('[data-testid^="UserAvatar-Container-"]').each((_, el) => {
+        if (authorUsername) return;
+        // Skip avatars inside embedded tweets
+        if (htmlDom(el).closest('[data-testid="tweet"]').length > 0) return;
+        if (htmlDom(el).closest('[data-testid="simpleTweet"]').length > 0)
+          return;
+        const testId = htmlDom(el).attr("data-testid") ?? "";
+        const match = testId.match(/^UserAvatar-Container-(.+)$/);
+        if (match) {
+          authorUsername = match[1];
+        }
+      });
+      return authorUsername ?? undefined;
+    }) as unknown as RulesOptions,
     readableContentHtml: (({
       htmlDom,
       url,
@@ -340,6 +542,15 @@ const metascraperTwitter = () => {
       htmlDom: CheerioAPI;
       url: string;
     }) => {
+      // Handle X article pages (x.com/i/article/*)
+      if (isArticleUrl(url)) {
+        const articleContent = extractArticleFromDom(htmlDom, url);
+        if (articleContent) {
+          return articleContent;
+        }
+        // Fall through to other extraction methods
+      }
+
       // Try full DOM extraction first (authenticated path)
       const domContent = extractFromDom(htmlDom, url);
       if (domContent) {
