@@ -809,10 +809,29 @@ async function crawlPage(
               if (!isXPage) return null;
 
               const initialStatusHtml = await activePage.content();
-              const articleUrl = extractXArticleUrlFromStatusHtml(
+
+              // Try extracting article URL from parsed HTML first
+              let articleUrl = extractXArticleUrlFromStatusHtml(
                 initialStatusHtml,
                 currentUrl,
               );
+
+              // Fallback: use page.evaluate() for live DOM access if JSDOM parsing failed
+              if (!articleUrl) {
+                articleUrl = await activePage.evaluate(() => {
+                  const links = document.querySelectorAll("a[href]");
+                  for (const link of links) {
+                    const href = link.getAttribute("href") ?? "";
+                    const relMatch = href.match(/^\/[\w]+\/article\/(\d+)$/);
+                    if (relMatch) return `https://x.com${href}`;
+                    const absMatch = href.match(
+                      /https?:\/\/(?:twitter\.com|x\.com)\/[\w]+\/article\/\d+/,
+                    );
+                    if (absMatch) return absMatch[0];
+                  }
+                  return null;
+                });
+              }
 
               if (!articleUrl) return null;
 
