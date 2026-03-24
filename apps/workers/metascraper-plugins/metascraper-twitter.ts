@@ -16,6 +16,14 @@ const escapeHtml = (text: string): string =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
+function getTopLevelTweetEls($: CheerioAPI) {
+  return $('[data-testid="tweet"], [data-testid="simpleTweet"]').filter(
+    (_, el) =>
+      $(el).parents('[data-testid="tweet"], [data-testid="simpleTweet"]')
+        .length === 0,
+  );
+}
+
 interface ExtractedTweet {
   authorName: string;
   authorHandle: string;
@@ -73,8 +81,15 @@ const extractSingleTweet = (
   $: CheerioAPI,
   mainTweetId: string | undefined,
 ): ExtractedTweet | null => {
+  // Clone and strip nested tweets (quoted tweets) so their metadata
+  // doesn't bleed into the parent tweet's extraction.
+  const contentRoot = el.clone();
+  contentRoot
+    .find('[data-testid="tweet"], [data-testid="simpleTweet"]')
+    .remove();
+
   // Extract tweet text
-  const tweetTextEl = el.find('[data-testid="tweetText"]').first();
+  const tweetTextEl = contentRoot.find('[data-testid="tweetText"]').first();
   const textHtml = tweetTextEl.html()?.trim() ?? "";
 
   // Extract author handle - look for links that match /@handle pattern
@@ -83,7 +98,7 @@ const extractSingleTweet = (
 
   // Find the user name section - typically the first group of links in the tweet header
   // The handle link points to /<username> and contains text starting with @
-  el.find('a[role="link"]').each((_, linkEl) => {
+  contentRoot.find('a[role="link"]').each((_, linkEl) => {
     const href = $(linkEl).attr("href") ?? "";
     const text = $(linkEl).text().trim();
     if (!authorHandle && text.startsWith("@") && /^\/\w+$/.test(href)) {
@@ -94,21 +109,23 @@ const extractSingleTweet = (
   // Author name: look for links to the user profile that don't start with @
   if (authorHandle) {
     const handlePath = authorHandle.replace("@", "/");
-    el.find(`a[role="link"][href="${handlePath}"]`).each((_, linkEl) => {
-      const text = $(linkEl).text().trim();
-      if (!authorName && text && !text.startsWith("@")) {
-        authorName = text;
-      }
-    });
+    contentRoot
+      .find(`a[role="link"][href="${handlePath}"]`)
+      .each((_, linkEl) => {
+        const text = $(linkEl).text().trim();
+        if (!authorName && text && !text.startsWith("@")) {
+          authorName = text;
+        }
+      });
   }
 
   // Extract timestamp
-  const timeEl = el.find("time").first();
+  const timeEl = contentRoot.find("time").first();
   const timestamp = timeEl.attr("datetime") ?? "";
 
   // Extract images
   const images: string[] = [];
-  el.find('[data-testid="tweetPhoto"] img').each((_, imgEl) => {
+  contentRoot.find('[data-testid="tweetPhoto"] img').each((_, imgEl) => {
     const src = $(imgEl).attr("src");
     if (src) {
       images.push(src);
@@ -116,13 +133,13 @@ const extractSingleTweet = (
   });
 
   // Check for video
-  const hasVideo = el.find('[data-testid="videoPlayer"]').length > 0;
+  const hasVideo = contentRoot.find('[data-testid="videoPlayer"]').length > 0;
 
   // Determine if this is the main tweet by checking for a link containing the status ID
   let isMainTweet = false;
   let tweetUrl: string | null = null;
   if (mainTweetId) {
-    el.find(`a[href*="/status/${mainTweetId}"]`).each((_, linkEl) => {
+    contentRoot.find(`a[href*="/status/${mainTweetId}"]`).each((_, linkEl) => {
       const href = $(linkEl).attr("href") ?? "";
       if (href.includes(`/status/${mainTweetId}`)) {
         isMainTweet = true;
@@ -132,7 +149,7 @@ const extractSingleTweet = (
 
   // Try to find a status link for this tweet (for non-main tweets)
   if (!isMainTweet) {
-    el.find('a[href*="/status/"]').each((_, linkEl) => {
+    contentRoot.find('a[href*="/status/"]').each((_, linkEl) => {
       const href = $(linkEl).attr("href") ?? "";
       // Match links like /username/status/12345 (with optional query params)
       if (!tweetUrl && /^\/\w+\/status\/\d+/.test(href)) {
@@ -404,7 +421,7 @@ const extractArticleFromDom = ($: CheerioAPI): string | undefined => {
  */
 const extractFromDom = ($: CheerioAPI, url: string): string | undefined => {
   const tweetId = extractTweetId(url);
-  const tweetEls = $('[data-testid="tweet"]');
+  const tweetEls = getTopLevelTweetEls($);
 
   if (tweetEls.length === 0) {
     return undefined;
@@ -587,6 +604,10 @@ const metascraperTwitter = () => {
   };
 
   return rules;
+};
+
+export const __private = {
+  extractFromDom,
 };
 
 export default metascraperTwitter;

@@ -816,11 +816,41 @@ async function crawlPage(
                 currentUrl,
               );
 
-              // Fallback: use page.evaluate() for live DOM access if JSDOM parsing failed
+              // Fallback: use page.evaluate() for live DOM access if JSDOM parsing failed.
+              // Scoped to the bookmarked tweet only (not the whole document).
               if (!articleUrl) {
-                articleUrl = await activePage.evaluate(() => {
-                  const links = document.querySelectorAll("a[href]");
-                  for (const link of links) {
+                articleUrl = await activePage.evaluate((pageUrl) => {
+                  const statusId = (() => {
+                    try {
+                      return (
+                        new URL(pageUrl).pathname.match(
+                          /\/status\/(\d+)/,
+                        )?.[1] ?? null
+                      );
+                    } catch {
+                      return null;
+                    }
+                  })();
+                  if (!statusId) return null;
+
+                  const topLevelTweets = Array.from(
+                    document.querySelectorAll<HTMLElement>(
+                      '[data-testid="tweet"]',
+                    ),
+                  ).filter(
+                    (t) => !t.parentElement?.closest('[data-testid="tweet"]'),
+                  );
+
+                  const mainTweet = topLevelTweets.find((t) =>
+                    Array.from(t.querySelectorAll("a[href]")).some((a) =>
+                      (a.getAttribute("href") ?? "").includes(
+                        `/status/${statusId}`,
+                      ),
+                    ),
+                  );
+                  if (!mainTweet) return null;
+
+                  for (const link of mainTweet.querySelectorAll("a[href]")) {
                     const href = link.getAttribute("href") ?? "";
                     const relMatch = href.match(/^\/[\w]+\/article\/(\d+)$/);
                     if (relMatch) return `https://x.com${href}`;
@@ -830,7 +860,7 @@ async function crawlPage(
                     if (absMatch) return absMatch[0];
                   }
                   return null;
-                });
+                }, currentUrl);
               }
 
               if (!articleUrl) return null;
